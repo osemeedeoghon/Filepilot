@@ -139,8 +139,9 @@ def test_no_endpoint_reads_or_writes_arbitrary_files(client):
     assert api == {
         "/api/health", "/api/scan", "/api/pick-folder", "/api/organize/preview",
         "/api/duplicates/start", "/api/duplicates/{job_id}", "/api/duplicates/{job_id}/cancel",
+        "/api/ai/status", "/api/documents/inspect",
     }
-    for url in ("/api/scan", "/api/organize/preview", "/api/duplicates/start"):
+    for url in ("/api/scan", "/api/organize/preview", "/api/duplicates/start", "/api/documents/inspect"):
         for method in ("delete", "put", "patch"):
             assert getattr(client, method)(url).status_code in (405, 415)
 
@@ -391,3 +392,137 @@ def test_duplicates_internal_error_is_safe(client, sample_tree, monkeypatch):
     assert job["status"] == "failed"
     assert job["error"]["code"] == "internal_error"
     assert "secret" not in str(job)
+
+
+# --- document intelligence (Stage 4, read-only) -------------------------------
+
+import filepilot.app as app_module  # noqa: E402
+from filepilot.local_ai import AIResult, AIUnavailable  # noqa: E402
+
+
+class StubAI:
+    def __init__(self, available=True, result=None, error=None):
+        self.available, self.result, self.error, self.calls = available, result, error, []
+
+    def status(self):
+        return {"available": self.available, "model": "stub:1" if self.available else None,
+                "reason": None if self.available else "Ollama is not installed on this Mac.",
+                "setup_steps": ["Install Ollama"], "installed": self.available, "running": self.available, "models": []}
+
+    def analyze(self, text, *, kind, title):
+        self.calls.append((text, kind, title))
+        if self.error:
+            raise self.error
+        return self.result
+
+
+def inspect_api(client, root, rel, **extra):
+    return client.post("/api/documents/inspect", json={"path": str(root), "relative_path": rel, **extra})
+
+
+def test_documents_inspect_markdown(client, sample_tree):
+    res = inspect_api(client, sample_tree, "readme.md")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["kind"] == "markdown"
+    assert data["extraction"]["status"] == "ok"
+    assert data["extraction"]["preview"] == "hello world"
+    assert data["analysis"]["generated_by"] == "rules"
+    assert data["ai"] == {"requested": False, "result": None, "error": None}
+    assert "_text" not in data
+
+
+@pytest.mark.parametrize(
+    "rel, status, code",
+    [
+        ("../outside/secret.txt", 400, "path_traversal"),
+        ("/etc/hosts", 400, "path_traversal"),
+        ("missing.txt", 404, "not_found"),
+    ],
+)
+def test_documents_inspect_errors(client, sample_tree, outside_tree, rel, status, code):
+    res = inspect_api(client, sample_tree, rel)
+    assert res.status_code == status
+    assert res.json()["error"]["code"] == code
+
+
+def test_documents_inspect_symlink(client, sample_tree, outside_tree):
+    (sample_tree / "link.txt").symlink_to(outside_tree / "secret.txt")
+    res = inspect_api(client, sample_tree, "link.txt")
+    assert res.status_code == 400
+    assert res.json()["error"]["code"] == "symlink"
+    assert "top secret" not in res.text
+
+
+def test_documents_inspect_blocked_root(client):
+    res = client.post("/api/documents/inspect", json={"path": "/", "relative_path": "etc/hosts"})
+    assert res.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"path": "/tmp"},
+        {"path": "/tmp", "relative_path": ""},
+        {"path": "/tmp", "relative_path": "a.txt", "use_ai": "yes"},
+        {"path": "/tmp", "relative_path": "a.txt", "command": "rm"},
+        {"path": "/tmp", "relative_path": "a" * 5000},
+    ],
+)
+def test_documents_inspect_malformed(client, body):
+    assert client.post("/api/documents/inspect", json=body).status_code == 422
+
+
+def test_documents_inspect_cross_origin_blocked(client, sample_tree):
+    res = client.post("/api/documents/inspect", json={"path": str(sample_tree), "relative_path": "readme.md"},
+                      headers={"origin": "https://evil.example"})
+    assert res.status_code == 403
+
+
+def test_ai_status_endpoint(client, monkeypatch):
+    monkeypatch.setattr(app_module, "ai_provider", StubAI(available=False))
+    data = client.get("/api/ai/status").json()
+    assert data["available"] is False and data["setup_steps"]
+
+
+def test_ai_unavailable_falls_back_to_rules(client, sample_tree, monkeypatch):
+    stub = StubAI(available=False, error=AIUnavailable("Ollama is not installed on this Mac."))
+    monkeypatch.setattr(app_module, "ai_provider", stub)
+    data = inspect_api(client, sample_tree, "readme.md", use_ai=True).json()
+    assert data["analysis"]["generated_by"] == "rules"
+    assert data["ai"]["result"] is None
+    assert "not installed" in data["ai"]["error"]
+
+
+def test_ai_result_is_labelled_and_separate(client, sample_tree, monkeypatch):
+    result = AIResult("Model summary.", "Report", "mentions findings", "stub:1", [])
+    stub = StubAI(result=result)
+    monkeypatch.setattr(app_module, "ai_provider", stub)
+    data = inspect_api(client, sample_tree, "readme.md", use_ai=True).json()
+    assert data["ai"]["result"]["generated_by"] == "local_ai"
+    assert data["ai"]["result"]["label"] == "Local AI · stub:1"
+    assert data["analysis"]["generated_by"] == "rules"  # rules result is kept alongside
+    assert stub.calls == [("hello world", "markdown", None)]
+
+
+def test_ai_not_called_without_text(client, sample_tree, monkeypatch):
+    stub = StubAI(result=AIResult("x", "Report", "", "stub:1", []))
+    monkeypatch.setattr(app_module, "ai_provider", stub)
+    (sample_tree / "scan.pdf").write_bytes(b"not really a pdf")
+    data = inspect_api(client, sample_tree, "scan.pdf", use_ai=True).json()
+    assert data["ai"]["error"] and stub.calls == []
+
+
+def test_ai_not_called_unless_requested(client, sample_tree, monkeypatch):
+    stub = StubAI(result=AIResult("x", "Report", "", "stub:1", []))
+    monkeypatch.setattr(app_module, "ai_provider", stub)
+    inspect_api(client, sample_tree, "readme.md")
+    assert stub.calls == []
+
+
+def test_documents_inspect_is_read_only(client, sample_tree):
+    before = sorted((str(p), p.lstat().st_mtime_ns, p.lstat().st_size) for p in sample_tree.rglob("*"))
+    for rel in ("readme.md", "docs/report.pdf", "docs/nested/data.csv"):
+        inspect_api(client, sample_tree, rel)
+    after = sorted((str(p), p.lstat().st_mtime_ns, p.lstat().st_size) for p in sample_tree.rglob("*"))
+    assert before == after

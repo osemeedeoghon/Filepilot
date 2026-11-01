@@ -82,6 +82,7 @@
                 <th data-sort="size" scope="col" class="num"><button type="button">Size</button></th>
                 <th data-sort="modified" scope="col"><button type="button">Modified</button></th>
                 <th data-sort="relative_path" scope="col"><button type="button">Relative path</button></th>
+                <th scope="col" class="actions-col"><span class="sr-only">Actions</span></th>
               </tr>
             </thead>
             <tbody id="file-rows"></tbody>
@@ -246,6 +247,49 @@
       </div>
     </section>
   </main>
+
+  <dialog id="doc-dialog" class="doc-dialog" aria-labelledby="doc-title">
+    <div class="doc-head">
+      <div class="doc-head-text">
+        <span id="doc-type" class="badge"></span>
+        <h2 id="doc-title"></h2>
+        <code id="doc-path" class="muted small"></code>
+      </div>
+      <button type="button" id="doc-close" class="btn btn-secondary">Close</button>
+    </div>
+    <div class="doc-scroll">
+      <section id="doc-status" class="status status-idle" role="status" aria-live="polite">
+        <span class="status-icon" aria-hidden="true"></span>
+        <div>
+          <strong id="doc-status-title"></strong>
+          <span id="doc-status-detail" class="muted"></span>
+        </div>
+      </section>
+      <ul id="doc-warnings" class="doc-warnings" hidden></ul>
+
+      <div id="doc-body" class="doc-grid" hidden>
+        <div class="doc-col">
+          <section class="card doc-card">
+            <h3>Extracted facts <span class="tag tag-fact">From the file</span></h3>
+            <dl id="doc-facts" class="facts"></dl>
+          </section>
+          <section class="card doc-card" id="doc-analysis-card">
+            <h3>Summary &amp; category <span class="tag tag-rules">Interpretation · rule-based</span></h3>
+            <div id="doc-analysis"></div>
+          </section>
+          <section class="card doc-card">
+            <h3>Local AI <span class="tag tag-ai">Optional · on this Mac only</span></h3>
+            <div id="doc-ai"></div>
+          </section>
+        </div>
+        <section class="card doc-card doc-preview-card">
+          <h3>Extracted text <span class="tag tag-fact">From the file</span></h3>
+          <p id="doc-preview-note" class="muted small"></p>
+          <pre id="doc-preview" class="doc-preview" tabindex="0"></pre>
+        </section>
+      </div>
+    </div>
+  </dialog>
 
   <footer class="footer muted small">FilePilot runs entirely on this Mac. Nothing is uploaded.</footer>
   <script src="/static/app.js"></script>

@@ -5,8 +5,9 @@ A local-first file-management assistant for macOS.
 - **Stage 1: safe local file scanner.** You choose a folder, and FilePilot lists its files and subfolders with their metadata.
 - **Stage 2: smart organization preview.** FilePilot proposes how those files could be sorted into category folders, and explains why for each file.
 - **Stage 3: exact duplicate detection.** FilePilot finds files with identical contents (SHA-256) and estimates the space that removing extra copies could free.
+- **Stage 4: local document intelligence.** FilePilot extracts text and facts from PDF, TXT, Markdown, DOCX and CSV files, previews them, and suggests a summary and a content-based category. It uses deterministic rules by default, plus an optional local AI model via Ollama.
 
-All stages are **strictly read-only**. FilePilot never creates, modifies, renames, moves or deletes files or folders. There is no apply or delete button and no endpoint that changes files, and nothing leaves your Mac. Stages 1 and 2 read only metadata. Stage 3 opens files read-only, solely to compute fingerprints.
+All stages are **strictly read-only**. FilePilot never creates, modifies, renames, moves or deletes files or folders. There is no apply or delete button and no endpoint that changes files, and nothing leaves your Mac. Stages 1 and 2 read only metadata. Stage 3 opens files read-only to compute fingerprints, and Stage 4 opens one document at a time, when you ask, to extract its text. No paid APIs or cloud AI are used.
 
 ## Prerequisites
 
@@ -49,6 +50,9 @@ FilePilot is a small local web app: a **FastAPI** backend and a **vanilla HTML/C
 - `scanner.py` is the shared foundation. It validates the chosen folder and walks it read-only, using `lstat` metadata and never following symbolic links.
 - `organizer.py` (Stage 2) turns scan metadata into a proposed plan with a pure, deterministic rules function.
 - `duplicates.py` (Stage 3) groups files by size and confirms matches with chunked SHA-256 reads. `jobs.py` runs it in a background thread so the UI can poll progress and cancel.
+- `documents.py` (Stage 4) reads one document safely and parses it in a separate, isolated Python process (`_extract_worker.py`) that is killed at the time limit.
+- `doc_rules.py` (Stage 4) produces the deterministic summary and categories.
+- `local_ai.py` (Stage 4) is the optional, loopback-only Ollama provider. Nothing else depends on it.
 - Request guards (allowed Host and Origin, JSON-only bodies, strict validation) and security headers live in `app.py`.
 
 ## Project layout
@@ -61,6 +65,10 @@ filepilot/
   scanner.py     # read-only, bounded folder scanner and path validation
   organizer.py   # Stage 2: deterministic, read-only organization planner
   duplicates.py  # Stage 3: size -> SHA-256 duplicate detection, safe chunked reads
+  documents.py   # Stage 4: safe reading + PDF/TXT/MD/DOCX/CSV extraction
+  _extract_worker.py  # Stage 4: isolated child process that parses one document
+  doc_rules.py   # Stage 4: extractive summary + keyword-based content categories
+  local_ai.py    # Stage 4: optional Ollama provider (loopback only, strict parsing)
   jobs.py        # Stage 3: background job with progress/cancel for duplicate scans
   picker.py      # native macOS folder picker (AppleScript `choose folder`)
   static/        # index.html, styles.css, app.js, favicon.svg (no build step)
@@ -70,7 +78,10 @@ tests/
   test_api.py        # HTTP API and security guards for all stages
   test_organizer.py  # Stage 2 rules, conflicts, boundaries
   test_duplicates.py # Stage 3 matching, unreadable/vanishing files, symlinks, limits
-requirements.txt      # runtime: fastapi, uvicorn
+  test_documents.py  # Stage 4 extraction, limits, boundaries, untrusted content
+  test_local_ai.py   # Stage 4 Ollama provider: availability, prompts, response parsing
+  docgen.py          # builds synthetic PDF/DOCX test documents
+requirements.txt      # runtime: fastapi, uvicorn, pypdf, python-docx
 requirements-dev.txt  # adds pytest, httpx
 ```
 
@@ -158,6 +169,75 @@ Each skipped file is listed with its reason, and the scan continues. App package
 
 When a limit stops the check, results are marked partial and the number of unchecked files is shown. Candidates with the largest potential savings are checked first, so a partial result still finds the most space.
 
+## Stage 4: document intelligence
+
+In the **Files** tab, supported documents have an **Inspect** button. It opens a document panel with:
+
+- **Extraction status:** text extracted, partly extracted, no text, *needs OCR*, encrypted, unsupported, too large, timed out, or error, each with a plain explanation.
+- **Extracted facts** (labelled *From the file*): size, modified date, pages, title, author, created date, encoding, delimiter, columns, rows, headings, tables, and word and character counts. Each fact shows its source, e.g. "PDF metadata", "first Markdown heading" or "counted".
+- **Summary and category** (labelled *Interpretation · rule-based*):
+  - The summary is **extractive**: the most representative sentences are quoted verbatim, so nothing is invented. Short documents get no summary, with a note explaining why.
+  - Categories (Invoice or receipt, Resume or CV, Contract or legal, Academic or research, Meeting notes, Letter, Report, Technical documentation, Medical, Travel, Recipe, Financial statement, Data table, General document) come from **words in the content, not the extension**. The matched evidence and a confidence level are shown.
+- **Extracted text preview** (the first 20,000 characters).
+- **Local AI (optional):** a "Summarize with local AI" button when Ollama is available. Otherwise, setup steps.
+
+### Supported formats
+
+| Format | How it is read | Notes |
+|---|---|---|
+| PDF | `pypdf`, text layer per page | Scanned pages have no text layer and are reported as **needs OCR** (OCR is not performed). Password-protected PDFs are reported as encrypted; no passwords are tried. PDFs with only an owner password are read. Up to 300 pages. |
+| TXT | Direct read | UTF-8, UTF-8 with BOM and UTF-16 are detected, with a Windows-1252 fallback. Binary files are refused. |
+| Markdown (`.md`, `.markdown`) | Direct read | Title from the first heading. Headings are counted outside code blocks. The preview keeps the original Markdown. |
+| DOCX | `python-docx` | Paragraphs and tables. Title from document properties, then the Title style, then the first heading. Macros are reported and never run. Password-protected or legacy `.doc` files are reported. |
+| CSV | Python `csv` | Delimiter and header detection, column names, row count, rows with inconsistent column counts. Formulas are shown as plain text. |
+
+### Using it without Ollama (default)
+
+Nothing to set up. Extraction, facts, the extractive summary and rule-based categories all work offline with no model.
+
+### Using it with Ollama (optional)
+
+FilePilot never installs Ollama or downloads models. To enable local AI:
+
+1. Install Ollama from https://ollama.com/download and open it (or run `ollama serve`).
+2. Download a small model once, for example `ollama pull llama3.2:3b` (about 2 GB).
+3. In FilePilot, open a document and click **Check again**, then **Summarize with local AI**.
+
+FilePilot uses the first installed non-embedding model. Set `FILEPILOT_OLLAMA_MODEL=<name>` to choose one, and `FILEPILOT_OLLAMA_URL` if Ollama listens on another local port. The URL **must** be a loopback address: anything else is refused, and system proxy settings are ignored, so document text cannot leave the Mac.
+
+AI results appear in a separate card labelled **Local AI · model name**, next to (not instead of) the rule-based results. The text sent to the model is limited to the first 8,000 characters.
+
+### Untrusted content
+
+Documents can contain text written to manipulate an AI ("ignore previous instructions…") or scripts and macros.
+
+- FilePilot never executes anything from a document.
+- The prompt marks the document as untrusted data between `<document>` tags. Any such tags inside the document are neutralised.
+- The model's reply is parsed strictly. Only a length-limited summary and a category from the fixed list are kept. Unknown categories become "General document", extra fields are dropped and reported, and control or bidi characters are stripped.
+- The reply is only displayed and never triggers an action.
+- The rule-based analysis can be influenced by words in a document, but its output is only a label with visible evidence.
+
+### Limits and isolation
+
+| Limit | Default |
+|---|---|
+| PDF/DOCX file size | 25 MB (`FILEPILOT_DOC_MAX_MB`). Larger files are refused before parsing. |
+| TXT/MD/CSV | First 2 MB read. The result is marked partial. |
+| DOCX unpacked size | 100 MB (zip-bomb guard) |
+| Pages / extracted characters / preview | 300 pages / 300,000 chars / 20,000 chars |
+| Parse time | 20 s. Parsing runs in a separate `python -I` process that is killed at the limit. |
+| Concurrent inspections / AI requests | 2 / 1 |
+| AI input / timeout | 8,000 chars / 120 s |
+
+### Troubleshooting
+
+- **"Needs OCR":** the PDF is scanned images. Run OCR in another app (e.g. Preview's Live Text, or `ocrmypdf`) and inspect the new copy.
+- **"Encrypted document":** open it in Preview with its password. FilePilot does not handle passwords.
+- **"Local AI is off: Ollama is not installed / not running":** follow the setup steps above, then click **Check again**.
+- **"No language model is installed":** run `ollama pull llama3.2:3b`.
+- **AI is slow:** small models (1–4B parameters) respond fastest. The first request also loads the model into memory.
+- **"Took too long":** the document hit the 20-second parse limit. It is probably very large or malformed.
+
 ## Safety measures (all stages)
 
 | Concern | How it's handled |
@@ -168,16 +248,17 @@ When a limit stops the check, results are marked partial and the number of unche
 | Symbolic links | A symlink chosen as the folder is rejected. Symlinks inside are listed but never followed, moved or read. A symlinked category folder is never used as a destination, and duplicate hashing opens files component by component with `O_NOFOLLOW`. |
 | Whole-Mac scans | Never automatic. `/`, `/System`, `/Library`, `/Users`, `/Applications`, `/Volumes`, `/usr`, `/private`, `/var`, `/etc`… are refused. |
 | Unreadable items | They are skipped and reported. Destinations inside unreadable folders are marked for review. |
-| Resource limits | 20,000 entries, depth 16, 30 seconds per scan, 2 concurrent scans or previews. Duplicate hashing is capped at 10 minutes or 100 GB, one job at a time, and can be cancelled. Unknown request fields are rejected. Booleans must be real JSON booleans, categories and scope are checked against fixed lists, and job IDs must match a strict pattern. |
-| File modification | No code path writes to the filesystem, and files are only ever opened with `O_RDONLY`. The API routes are: `GET /api/health`, `POST /api/scan`, `POST /api/pick-folder`, `POST /api/organize/preview`, `POST /api/duplicates/start`, `GET /api/duplicates/{id}` and `POST /api/duplicates/{id}/cancel` (cancel only stops FilePilot's own background check). Tests confirm that contents, sizes, modes and mtimes are unchanged after a preview or a duplicate check. |
+| Resource limits | 20,000 entries, depth 16, 30 seconds per scan, 2 concurrent scans or previews. Duplicate hashing is capped at 10 minutes or 100 GB, one job at a time, and can be cancelled. Document inspection has size, page, character and time limits, and runs in an isolated child process. Unknown request fields are rejected. Booleans must be real JSON booleans, categories and scope are checked against fixed lists, and job IDs must match a strict pattern. |
+| File modification | No code path writes to the filesystem, and files are only ever opened with `O_RDONLY`. The API routes are: `GET /api/health`, `POST /api/scan`, `POST /api/pick-folder`, `POST /api/organize/preview`, `POST /api/duplicates/start`, `GET /api/duplicates/{id}`, `POST /api/duplicates/{id}/cancel` (cancel only stops FilePilot's own background check), `GET /api/ai/status` and `POST /api/documents/inspect`. Tests confirm that contents, sizes, modes and mtimes are unchanged after a preview, a duplicate check or a document inspection. |
 | Front-end injection | A strict CSP allows no inline scripts. All file names are rendered with `textContent`. |
-| Privacy | No external requests, CDNs or analytics. File contents, hashes, names and paths stay on this Mac. They go only to the browser page on `127.0.0.1`. |
+| Privacy | No external requests, CDNs or analytics. File contents, extracted text, hashes, names and paths stay on this Mac. They go only to the browser page on `127.0.0.1` and, if you click the AI button, to Ollama on a loopback address. Extracted text is never written to disk or logged. |
+| Untrusted documents | Nothing in a document is executed. Prompts mark document text as untrusted data, and model replies are parsed strictly against a fixed schema and category list. |
 
 Limits can be tuned with `FILEPILOT_PORT`, `FILEPILOT_MAX_ENTRIES` and `FILEPILOT_MAX_DEPTH`. The host cannot be changed.
 
 ## What was tested
 
-There are 197 automated tests (`python -m pytest -q`), all passing. To run one stage's tests, use `python -m pytest -q tests/test_duplicates.py` (or another test file).
+There are 318 automated tests (`python -m pytest -q`), all passing. To run one stage's tests, use `python -m pytest -q tests/test_duplicates.py` (or another test file).
 
 - **Stage 1 (71 tests):**
   - valid scans and file metadata
@@ -216,6 +297,17 @@ There are 197 automated tests (`python -m pytest -q`), all passing. To run one s
   - **Limits:** byte limit, time limit, cancellation, progress reaching completion.
   - **Read-only:** a before/after snapshot of contents, sizes, modes, mtimes and inodes.
   - **API:** job start, poll and result; the hidden toggle; fast failure for invalid, blocked and traversal paths and symlink roots; malformed requests; one job at a time (409); cancel; unknown or malformed job IDs; cross-origin; read-only; safe internal errors.
+- **Stage 4 (121 tests, all with synthetic documents built in `tests/docgen.py`):**
+  - **PDF:** text and metadata, scanned PDF (needs OCR), partly scanned, password-protected, owner-password-only, 4 malformed variants, page limit.
+  - **TXT and Markdown:** extraction and an extractive summary checked to be verbatim, encodings (UTF-8, BOM, UTF-16, Windows-1252, a truncated multi-byte character), binary data in a `.txt`, empty files, Markdown title, heading count and plain-text conversion, stripping of control and bidi characters.
+  - **DOCX:** text, tables and metadata, title fallbacks, empty, malformed, encrypted or legacy files, a zip bomb, macros reported but not run.
+  - **CSV:** structure, delimiter and header, inconsistent rows, empty, an oversized field, formulas shown as text.
+  - **Limits:** unsupported types not opened, large text truncated, large PDFs refused before parsing, preview and character limits, the isolated worker, the timeout.
+  - **Boundaries:** six traversal patterns, `..` in the root, reused root validation, symlinked file, symlinked folder, symlink root, missing file, a folder named like a document, a FIFO, an unreadable file.
+  - **Untrusted content:** an injection document causes no subprocess, system call or file change, and its output stays within the fixed categories.
+  - **Rules:** summary thresholds, headings and table rows kept out of summaries, six content categories, the fallback, read-only snapshots.
+  - **Local AI:** loopback-only URLs (4 allowed, 9 refused), a remote URL never contacted, proxies bypassed, not running, no models, model selection, never pulling models, timeout, the delimited prompt, tags neutralised inside the document, input truncation, strict parsing (plain, fenced, wrapped, 8 failure cases), injected categories and fields neutralised, summary cap.
+  - **API:** inspect, errors, symlinks, blocked root, malformed bodies, cross-origin, AI status, fallback when AI is unavailable, AI results labelled and kept separate, AI never called without text or without a request, read-only.
 
 Manual checks in the browser:
 
@@ -226,12 +318,15 @@ Manual checks in the browser:
 - **Stage 3:** ran a demo folder with copies under different names, same-name files with different contents, hard links, empty files, a symlink, an `.app` package and an unreadable copy. The groups, the recoverable estimate (17.6 MB), the hard-link note and the skip reasons were all correct.
 - **Stage 3, large files:** ran 6 × 3 GB sparse files and watched the live progress bar track bytes read. Cancel returned partial results.
 - **Stage 3, layout:** checked desktop and phone layouts with no horizontal scroll.
+- **Stage 4:** inspected synthetic files covering every status: an invoice PDF (title and author facts, high-confidence invoice category with evidence), a scanned PDF (needs OCR), an encrypted PDF, a meeting-notes DOCX (extractive summary, title from the Title style), a README, an expenses CSV, and a prompt-injection text file (shown purely as text, classified "General document"). A `.heic` file correctly had no Inspect button. With Ollama absent, the AI card showed the setup steps.
+- **Stage 4 fixes from this testing:** a race when closing and reopening the dialog quickly, inconsistent word counts, and headings merging into summary sentences.
+- **Stage 4, layout:** checked the full-screen dialog on mobile with no horizontal scroll, and that Stages 1–3 still work on the same folder.
 
 ## Changes to Stage 1 code
 
 - `scanner.scan_folder` gained optional `collect_folders` and `prune` arguments, and `FileEntry` gained an internal `executable` flag. These stay out of `to_dict()`, so the `/api/scan` response is unchanged (a test checks this). Stage 1 behaviour is otherwise the same.
 - `/api/health` also lists `organize_categories` and the duplicate limits.
-- Stage 3: the UI tab switching now handles three tabs. The `include_hidden` field in every request now requires a real boolean, which tightens validation; the UI already sent booleans.
+- Stage 3: the UI tab switching now handles three tabs. Stage 4 adds an **Inspect** column to the Files table and document limits to `/api/health`. Existing endpoints and responses are unchanged. The `include_hidden` field in every request now requires a real boolean, which tightens validation; the UI already sent booleans.
 - The UI shows the file list and the preview as two tabs. The Stage 1 elements and behaviour are unchanged.
 
 ## Known limitations
@@ -250,4 +345,9 @@ Manual checks in the browser:
 - **Duplicates: limits.** The check covers what the listing found (up to 20,000 entries). Very large folders may hit the 10-minute or 100 GB limit and return partial results. Progress lives in memory, so restarting the server forgets running and finished checks.
 - **Duplicates: what's skipped.** Files inside app packages, `.git` and `node_modules` are deliberately skipped. Duplicates there won't be reported.
 - **Duplicates: speed.** Hashing speed depends on the disk. iCloud files that aren't downloaded may be fetched by macOS when read, or fail and be listed as skipped.
+- **Documents: no OCR.** Scanned PDFs are reported but not read. Images, PowerPoint, Pages, RTF, `.doc` and other formats are not supported yet.
+- **Documents: PDF layout.** Text order follows the PDF's internal structure, so multi-column layouts or tables may come out jumbled.
+- **Documents: rule-based results are heuristic.** Summaries are extractive and categories come from keywords, so unusual documents may get "General document" or a weak match. The confidence and evidence are shown so you can judge.
+- **Documents: local AI.** It is optional and needs Ollama plus a downloaded model (several GB of disk, and reasonable RAM). Small models can be wrong or slow. Only the first 8,000 characters are sent. Results are not cached.
+- **Documents: memory.** The isolated worker has a time limit but no hard memory cap on macOS. The size and zip-bomb limits keep inputs bounded.
 - A deprecation warning from Starlette's test client appears in test output. It does not affect the app.

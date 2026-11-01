@@ -15,7 +15,9 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import picker
 from .config import settings
+from .documents import DocumentAccessError, inspect_document
 from .jobs import DuplicateJobManager, JobBusy
+from .local_ai import AIResponseError, AIUnavailable, OllamaProvider
 from .organizer import CATEGORIES, preview_organization
 from .scanner import ScanError, scan_folder
 
@@ -33,6 +35,9 @@ ALLOWED_ORIGINS = {
 _scan_slots = threading.BoundedSemaphore(2)
 _picker_lock = threading.Lock()
 duplicate_jobs = DuplicateJobManager()
+_doc_slots = threading.BoundedSemaphore(2)
+_ai_lock = threading.Lock()
+ai_provider = OllamaProvider()
 JobId = PathParam(pattern=r"^[A-Za-z0-9_-]{16,64}$")
 
 app = FastAPI(title="FilePilot", version="0.1.0", docs_url=None, redoc_url=None, openapi_url=None)
@@ -68,6 +73,11 @@ async def scan_error_handler(_request: Request, exc: ScanError) -> JSONResponse:
     return _error(exc.status, exc.code, exc.message)
 
 
+@app.exception_handler(DocumentAccessError)
+async def document_error_handler(_request: Request, exc: DocumentAccessError) -> JSONResponse:
+    return _error(exc.status, exc.code, exc.message)
+
+
 @app.exception_handler(Exception)
 async def unexpected_error_handler(_request: Request, exc: Exception) -> JSONResponse:
     logger.exception("Unexpected error", exc_info=exc)
@@ -100,6 +110,14 @@ class DuplicateScanRequest(BaseModel):
     include_hidden: StrictBool = False
 
 
+class DocumentInspectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=settings.max_path_length)
+    relative_path: str = Field(min_length=1, max_length=settings.max_path_length)
+    use_ai: StrictBool = False
+
+
 @app.get("/", include_in_schema=False)
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -118,6 +136,9 @@ def health() -> dict:
             "max_path_length": settings.max_path_length,
             "dup_max_seconds": settings.dup_max_seconds,
             "dup_max_bytes": settings.dup_max_bytes,
+            "doc_max_bytes": settings.doc_max_bytes,
+            "doc_text_read_bytes": settings.doc_text_read_bytes,
+            "doc_timeout_seconds": settings.doc_timeout_seconds,
         },
     }
 
@@ -192,6 +213,40 @@ def duplicates_cancel(job_id: str = JobId) -> JSONResponse:
     if job is None:
         return _error(404, "unknown_job", "That duplicate scan is no longer available.")
     return JSONResponse({"id": job.id, "status": job.status, "cancel_requested": True})
+
+
+@app.get("/api/ai/status")
+def ai_status() -> JSONResponse:
+    """Report whether a local Ollama model is available. Never installs or downloads anything."""
+    return JSONResponse(ai_provider.status())
+
+
+@app.post("/api/documents/inspect")
+def documents_inspect(body: DocumentInspectRequest) -> JSONResponse:
+    """Extract text and facts from one document inside the selected folder. Read-only."""
+    if not _doc_slots.acquire(blocking=False):
+        return _error(429, "busy", "Another document is being read. Try again in a moment.")
+    try:
+        report = inspect_document(body.path, body.relative_path)
+    finally:
+        _doc_slots.release()
+
+    text = report.pop("_text", "")
+    report["ai"] = {"requested": body.use_ai, "result": None, "error": None}
+    if body.use_ai:
+        if not text.strip() or report["extraction"]["status"] not in ("ok", "partial"):
+            report["ai"]["error"] = "There is no extracted text for the local model to read."
+        elif not _ai_lock.acquire(blocking=False):
+            report["ai"]["error"] = "The local model is busy with another document. Try again in a moment."
+        else:
+            try:
+                result = ai_provider.analyze(text, kind=report["kind"], title=report.get("title"))
+                report["ai"]["result"] = result.to_dict()
+            except (AIUnavailable, AIResponseError) as exc:
+                report["ai"]["error"] = str(exc)
+            finally:
+                _ai_lock.release()
+    return JSONResponse(report)
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

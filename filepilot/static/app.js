@@ -120,6 +120,7 @@
 
   function showResults(data) {
     state.files = data.files;
+    state.root = data.root;
     state.shown = PAGE_SIZE;
     els.path.value = data.root;
 
@@ -229,6 +230,18 @@
       tr.append(cell("num", f.kind === "symlink" ? "—" : formatBytes(f.size), "Size"));
       tr.append(cell("date", dateFmt.format(new Date(f.modified)), "Modified"));
       tr.append(cell("path", f.relative_path));
+      const act = document.createElement("td");
+      act.className = "actions";
+      if (isInspectable(f)) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn btn-secondary btn-small";
+        btn.dataset.inspect = f.relative_path;
+        btn.textContent = "Inspect";
+        btn.setAttribute("aria-label", `Inspect ${f.name}`);
+        act.append(btn);
+      }
+      tr.append(act);
       frag.append(tr);
     }
     els.rows.replaceChildren(frag);
@@ -787,6 +800,222 @@
   d.search.addEventListener("input", () => { clearTimeout(dupSearchTimer); dupSearchTimer = setTimeout(applyDupFilters, 120); });
   d.sort.addEventListener("change", applyDupFilters);
   d.more.addEventListener("click", () => { dup.shown += GROUP_PAGE; renderGroups(); });
+
+  // --- Document inspector (read-only) ---------------------------------------------
+  const DOC_EXTENSIONS = new Set(["pdf", "txt", "md", "markdown", "docx", "csv"]);
+  const DOC_STATUS = {
+    ok: ["complete", "Text extracted"],
+    partial: ["empty", "Partly extracted"],
+    empty: ["empty", "No text found"],
+    needs_ocr: ["empty", "Needs OCR"],
+    encrypted: ["error", "Encrypted document"],
+    unsupported: ["error", "Unsupported file type"],
+    too_large: ["error", "File too large"],
+    timeout: ["error", "Took too long"],
+    error: ["error", "Couldn't read this document"],
+  };
+  const doc = {
+    dialog: $("doc-dialog"),
+    close: $("doc-close"),
+    type: $("doc-type"),
+    title: $("doc-title"),
+    path: $("doc-path"),
+    status: $("doc-status"),
+    statusTitle: $("doc-status-title"),
+    statusDetail: $("doc-status-detail"),
+    warnings: $("doc-warnings"),
+    body: $("doc-body"),
+    facts: $("doc-facts"),
+    analysis: $("doc-analysis"),
+    ai: $("doc-ai"),
+    previewNote: $("doc-preview-note"),
+    preview: $("doc-preview"),
+  };
+  const docState = { requestId: 0, current: null, report: null, aiStatus: null };
+
+  function isInspectable(f) {
+    return f.kind === "file" && DOC_EXTENSIONS.has(f.extension);
+  }
+
+  function setDocStatus(kind, title, detail) {
+    doc.status.className = `status status-${kind}`;
+    doc.statusTitle.textContent = title;
+    doc.statusDetail.textContent = detail || "";
+  }
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function factValue(f) {
+    if (f.label === "Size" && typeof f.value === "number") return formatBytes(f.value);
+    if (f.label === "Modified") return dateFmt.format(new Date(f.value));
+    return typeof f.value === "number" ? numberFmt.format(f.value) : String(f.value);
+  }
+
+  async function openDocument(relativePath) {
+    if (!state.root) return;
+    const id = ++docState.requestId;
+    docState.current = relativePath;
+    docState.report = null;
+    const name = relativePath.split("/").pop();
+    const ext = name.includes(".") ? name.split(".").pop().toUpperCase() : "";
+    doc.type.textContent = ext || "File";
+    doc.title.textContent = name;
+    doc.path.textContent = relativePath;
+    doc.body.hidden = true;
+    doc.warnings.hidden = true;
+    setDocStatus("running", "Reading document…", "Extracting text on this Mac. Nothing is changed.");
+    if (!doc.dialog.open) doc.dialog.showModal();
+    try {
+      const report = await postJSON("/api/documents/inspect", { path: state.root, relative_path: relativePath, use_ai: false });
+      if (id !== docState.requestId) return;
+      showDocument(report);
+    } catch (err) {
+      if (id !== docState.requestId) return;
+      setDocStatus("error", "Couldn't open this document", err.message);
+    }
+  }
+
+  function showDocument(r) {
+    docState.report = r;
+    doc.type.textContent = r.type_label;
+    if (r.title) doc.title.textContent = r.title;
+    const [kind, title] = DOC_STATUS[r.extraction.status] || ["error", "Couldn't read this document"];
+    setDocStatus(kind, title, r.extraction.message);
+
+    doc.warnings.replaceChildren(...r.extraction.warnings.map((w) => el("li", null, w)));
+    doc.warnings.hidden = r.extraction.warnings.length === 0;
+
+    doc.facts.replaceChildren();
+    for (const f of r.facts) {
+      const dd = el("dd", null, factValue(f));
+      dd.append(el("small", null, f.source));
+      doc.facts.append(el("dt", null, f.label), dd);
+    }
+
+    doc.analysis.replaceChildren();
+    if (r.analysis) {
+      renderAnalysis(doc.analysis, r.analysis);
+    } else {
+      doc.analysis.append(el("p", "analysis-note", "No summary or category, because no text could be extracted."));
+    }
+
+    const ex = r.extraction;
+    doc.preview.textContent = ex.preview;
+    if (!ex.char_count) {
+      doc.previewNote.textContent = "Nothing was extracted.";
+    } else if (ex.preview_truncated || ex.read_truncated) {
+      doc.previewNote.textContent = `Showing the first ${numberFmt.format(ex.preview.length)} of ${numberFmt.format(ex.char_count)} extracted characters${ex.read_truncated ? " (the file itself was only partly read)" : ""}.`;
+    } else {
+      doc.previewNote.textContent = `${numberFmt.format(ex.char_count)} characters, ${numberFmt.format(ex.word_count)} words.`;
+    }
+    doc.body.hidden = false;
+    renderAI();
+  }
+
+  function renderAnalysis(container, a) {
+    if (a.summary) {
+      container.append(el(a.generated_by === "rules" ? "blockquote" : "p", a.generated_by === "rules" ? "summary-quote" : "summary-ai", a.summary));
+    }
+    container.append(el("p", "analysis-note", a.summary_note));
+    const ul = el("ul", "cat-list");
+    for (const c of a.categories) {
+      const li = el("li");
+      li.append(el("span", "cat-name", c.name));
+      if (c.confidence !== "model") li.append(el("span", `conf conf-${c.confidence}`, `${c.confidence} confidence`));
+      if (c.evidence.length) li.append(el("span", "cat-evidence", `${a.generated_by === "rules" ? "Evidence" : "Reason"}: ${c.evidence.join(", ")}`));
+      ul.append(li);
+    }
+    container.append(ul, el("p", "analysis-note", a.category_note));
+    for (const n of a.notes || []) container.append(el("p", "analysis-note", n));
+  }
+
+  async function loadAIStatus(force) {
+    if (docState.aiStatus && !force) return docState.aiStatus;
+    try {
+      const res = await fetch("/api/ai/status");
+      docState.aiStatus = await res.json();
+    } catch {
+      docState.aiStatus = { available: false, reason: "Could not check for a local AI model.", setup_steps: [] };
+    }
+    return docState.aiStatus;
+  }
+
+  async function renderAI(force = false) {
+    const r = docState.report;
+    doc.ai.replaceChildren(el("p", "muted small", "Checking for a local model…"));
+    const s = await loadAIStatus(force);
+    if (docState.report !== r) return;
+    const box = el("div", "ai-block");
+    if (!r.analysis) {
+      box.append(el("p", "muted", "Local AI needs extracted text, and this document has none."));
+    } else if (s.available) {
+      box.append(el("p", null, `Ollama is running with “${s.model}”. The extracted text is sent only to Ollama on this Mac (127.0.0.1), never to the internet.`));
+      const btn = el("button", "btn btn-primary btn-small", "Summarize with local AI");
+      btn.type = "button";
+      btn.addEventListener("click", () => runAI(btn));
+      box.append(btn);
+    } else {
+      box.append(el("p", null, `Local AI is off: ${s.reason || "not available."} The rule-based results above work without it.`));
+      if (s.setup_steps?.length) {
+        const ol = el("ol");
+        for (const step of s.setup_steps) {
+          const li = el("li");
+          // Show `code` spans as code; everything is text, never HTML.
+          step.split("`").forEach((part, i) => li.append(i % 2 ? el("code", null, part) : document.createTextNode(part)));
+          ol.append(li);
+        }
+        box.append(el("p", "muted small", "To turn it on (optional):"), ol);
+      }
+      const again = el("button", "btn btn-secondary btn-small", "Check again");
+      again.type = "button";
+      again.addEventListener("click", () => renderAI(true));
+      box.append(again);
+    }
+    doc.ai.replaceChildren(box);
+  }
+
+  async function runAI(btn) {
+    const r = docState.report;
+    btn.disabled = true;
+    btn.textContent = "Running the local model… (this can take a minute)";
+    const out = el("div", "ai-result");
+    try {
+      const res = await postJSON("/api/documents/inspect", { path: state.root, relative_path: r.relative_path, use_ai: true });
+      if (docState.report !== r) return;
+      if (res.ai.result) {
+        const tag = el("p", null);
+        tag.append(el("span", "tag tag-ai", res.ai.result.label));
+        out.append(tag);
+        renderAnalysis(out, res.ai.result);
+      } else {
+        out.append(el("p", "ai-error", res.ai.error || "The local model did not return a result."));
+      }
+    } catch (err) {
+      out.append(el("p", "ai-error", err.message));
+    }
+    doc.ai.querySelector(".ai-result")?.remove();
+    doc.ai.append(out);
+    btn.disabled = false;
+    btn.textContent = "Run again";
+  }
+
+  doc.close.addEventListener("click", () => doc.dialog.close());
+  doc.dialog.addEventListener("click", (e) => { if (e.target === doc.dialog) doc.dialog.close(); });
+  doc.dialog.addEventListener("close", () => {
+    // The close event is queued; ignore it if another document was opened meanwhile.
+    if (doc.dialog.open) return;
+    docState.requestId++;
+    docState.report = null;
+  });
+  els.rows.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-inspect]");
+    if (btn) openDocument(btn.dataset.inspect);
+  });
 
   // Events
   els.form.addEventListener("submit", (e) => { e.preventDefault(); runScan(); });
