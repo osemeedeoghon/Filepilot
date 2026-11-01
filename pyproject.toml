@@ -1,0 +1,9 @@
+[project]
+name = "filepilot"
+version = "0.1.0"
+description = "Local-first file-management assistant for macOS (Stage 1: read-only scanner)"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

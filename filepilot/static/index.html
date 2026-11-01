@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FilePilot</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="/static/favicon.svg" alt="" class="brand-mark" width="28" height="28">
+      <span class="brand-name">FilePilot</span>
+      <span class="brand-tag">Read-only preview</span>
+    </div>
+    <div class="privacy-pill" title="FilePilot runs on 127.0.0.1 and never uploads file names or contents.">
+      <span class="dot"></span> Local only
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="card picker-card" aria-labelledby="picker-title">
+      <h1 id="picker-title">Inspect a folder</h1>
+      <p class="muted">Choose a folder to inspect its files. FilePilot is read-only: it never changes, moves, renames or deletes anything.</p>
+
+      <form id="scan-form" class="scan-form" novalidate>
+        <label for="path-input" class="sr-only">Folder path</label>
+        <div class="path-row">
+          <button type="button" id="choose-btn" class="btn btn-secondary" hidden>Choose folder…</button>
+          <input id="path-input" name="path" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="/Users/you/Documents" maxlength="1024" aria-describedby="path-hint">
+          <button type="submit" id="scan-btn" class="btn btn-primary">Scan</button>
+        </div>
+        <div class="form-meta">
+          <label class="checkbox"><input type="checkbox" id="hidden-toggle"> Include hidden files</label>
+          <span id="path-hint" class="muted small">Full path starting with “/”. System folders like / and /System are blocked.</span>
+        </div>
+      </form>
+    </section>
+
+    <section id="status" class="status status-idle" role="status" aria-live="polite">
+      <span class="status-icon" aria-hidden="true"></span>
+      <div>
+        <strong id="status-title">Ready</strong>
+        <span id="status-detail" class="muted">Choose a folder to begin.</span>
+      </div>
+    </section>
+
+    <section id="results" hidden>
+      <div class="metrics">
+        <div class="metric"><span class="metric-label">Files</span><span id="m-files" class="metric-value">0</span></div>
+        <div class="metric"><span class="metric-label">Folders</span><span id="m-folders" class="metric-value">0</span></div>
+        <div class="metric"><span class="metric-label">Total size</span><span id="m-size" class="metric-value">0 B</span></div>
+        <div class="metric"><span class="metric-label">Skipped</span><span id="m-skipped" class="metric-value">0</span></div>
+      </div>
+
+      <div id="notices"></div>
+
+      <div class="tabs" role="tablist" aria-label="Result views">
+        <button type="button" role="tab" id="tab-files" class="tab" aria-selected="true" aria-controls="panel-files">Files</button>
+        <button type="button" role="tab" id="tab-organize" class="tab" aria-selected="false" aria-controls="panel-organize" tabindex="-1">Organize preview</button>
+        <button type="button" role="tab" id="tab-duplicates" class="tab" aria-selected="false" aria-controls="panel-duplicates" tabindex="-1">Duplicates</button>
+      </div>
+
+      <div id="panel-files" role="tabpanel" aria-labelledby="tab-files">
+      <div class="card table-card">
+        <div class="toolbar">
+          <input id="search-input" type="search" placeholder="Search by name or path" aria-label="Search files" maxlength="200">
+          <select id="type-filter" aria-label="Filter by file type">
+            <option value="">All types</option>
+          </select>
+          <span id="match-count" class="muted small"></span>
+        </div>
+
+        <div class="table-wrap">
+          <table id="file-table">
+            <thead>
+              <tr>
+                <th data-sort="name" scope="col"><button type="button">Name</button></th>
+                <th data-sort="category" scope="col"><button type="button">Type</button></th>
+                <th data-sort="size" scope="col" class="num"><button type="button">Size</button></th>
+                <th data-sort="modified" scope="col"><button type="button">Modified</button></th>
+                <th data-sort="relative_path" scope="col"><button type="button">Relative path</button></th>
+              </tr>
+            </thead>
+            <tbody id="file-rows"></tbody>
+          </table>
+        </div>
+        <div id="empty-filter" class="empty" hidden>No files match your search or filter.</div>
+        <div class="table-footer">
+          <button type="button" id="more-btn" class="btn btn-secondary" hidden>Show more</button>
+        </div>
+      </div>
+
+      <details id="skipped-panel" class="card skipped" hidden>
+        <summary>Items FilePilot could not read</summary>
+        <ul id="skipped-list"></ul>
+      </details>
+      </div>
+
+      <div id="panel-organize" role="tabpanel" aria-labelledby="tab-organize" hidden>
+        <div class="preview-banner">
+          <strong>Preview only.</strong> Nothing has been moved, renamed or created. FilePilot can't apply plans yet.
+        </div>
+
+        <div class="card org-controls">
+          <fieldset class="cat-fieldset">
+            <legend>Categories to organize</legend>
+            <div id="cat-chips" class="chips"></div>
+            <div class="chip-actions">
+              <button type="button" id="cat-all" class="link-btn">Select all</button>
+              <button type="button" id="cat-none" class="link-btn">Clear</button>
+            </div>
+          </fieldset>
+          <fieldset class="scope-fieldset">
+            <legend>Which files</legend>
+            <label class="radio"><input type="radio" name="scope" value="top_level" checked> Top-level files only</label>
+            <label class="radio"><input type="radio" name="scope" value="all"> Include subfolders <span class="muted small">(keeps subfolder paths)</span></label>
+          </fieldset>
+        </div>
+
+        <section id="org-status" class="status status-idle" role="status" aria-live="polite">
+          <span class="status-icon" aria-hidden="true"></span>
+          <div>
+            <strong id="org-status-title">No preview yet</strong>
+            <span id="org-status-detail" class="muted"></span>
+          </div>
+        </section>
+
+        <div id="org-body" hidden>
+          <div class="metrics org-metrics">
+            <button type="button" class="metric metric-btn" data-status="move"><span class="metric-label"><span class="swatch s-move"></span>Ready to move</span><span id="o-move" class="metric-value">0</span></button>
+            <button type="button" class="metric metric-btn" data-status="conflict"><span class="metric-label"><span class="swatch s-conflict"></span>Name conflicts</span><span id="o-conflict" class="metric-value">0</span></button>
+            <button type="button" class="metric metric-btn" data-status="review"><span class="metric-label"><span class="swatch s-review"></span>Needs review</span><span id="o-review" class="metric-value">0</span></button>
+            <button type="button" class="metric metric-btn" data-status="keep"><span class="metric-label"><span class="swatch s-keep"></span>Left in place</span><span id="o-keep" class="metric-value">0</span></button>
+          </div>
+
+          <div id="org-notices" class="notices"></div>
+
+          <div class="card table-card">
+            <div class="toolbar">
+              <input id="org-search" type="search" placeholder="Search current or proposed path" aria-label="Search the plan" maxlength="200">
+              <select id="org-status-filter" aria-label="Filter by status">
+                <option value="">All statuses</option>
+                <option value="move">Ready to move</option>
+                <option value="conflict">Name conflicts</option>
+                <option value="review">Needs review</option>
+                <option value="keep">Left in place</option>
+              </select>
+              <select id="org-cat-filter" aria-label="Filter by suggested category">
+                <option value="">All categories</option>
+              </select>
+              <span id="org-count" class="muted small"></span>
+            </div>
+            <div class="table-wrap">
+              <table id="org-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Current path</th>
+                    <th scope="col">Suggested category</th>
+                    <th scope="col">Proposed destination</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">Reason</th>
+                  </tr>
+                </thead>
+                <tbody id="org-rows"></tbody>
+              </table>
+            </div>
+            <div id="org-empty" class="empty" hidden>No items match your search or filters.</div>
+            <div class="table-footer">
+              <button type="button" id="org-more" class="btn btn-secondary" hidden>Show more</button>
+            </div>
+          </div>
+
+          <details id="protected-panel" class="card skipped" hidden>
+            <summary>Protected folders (not opened or reorganized)</summary>
+            <ul id="protected-list"></ul>
+          </details>
+        </div>
+      </div>
+
+      <div id="panel-duplicates" role="tabpanel" aria-labelledby="tab-duplicates" hidden>
+        <div class="preview-banner">
+          <strong>Read-only.</strong> FilePilot reads file contents only to compute SHA-256 fingerprints on this Mac. Nothing is deleted, moved or uploaded.
+        </div>
+
+        <div class="card dup-controls">
+          <div>
+            <strong>Find exact duplicates</strong>
+            <p class="muted small">Files are compared by size, then by SHA-256 of their full contents. File names are ignored. Symbolic links, empty files, app packages and version-control folders are skipped.</p>
+          </div>
+          <div class="dup-actions">
+            <button type="button" id="dup-start" class="btn btn-primary">Find duplicates</button>
+            <button type="button" id="dup-cancel" class="btn btn-secondary" hidden>Cancel</button>
+          </div>
+        </div>
+
+        <section id="dup-status" class="status status-idle" role="status" aria-live="polite">
+          <span class="status-icon" aria-hidden="true"></span>
+          <div class="dup-status-text">
+            <strong id="dup-status-title">Not started</strong>
+            <span id="dup-status-detail" class="muted">Checking large folders can take a while. You can cancel at any time.</span>
+            <div id="dup-progress" class="progress" hidden>
+              <div class="progress-track"><div id="dup-progress-bar" class="progress-bar"></div></div>
+              <span id="dup-progress-text" class="muted small"></span>
+            </div>
+          </div>
+        </section>
+
+        <div id="dup-body" hidden>
+          <div class="metrics">
+            <div class="metric"><span class="metric-label">Duplicate groups</span><span id="d-groups" class="metric-value">0</span></div>
+            <div class="metric"><span class="metric-label">Extra copies</span><span id="d-extra" class="metric-value">0</span></div>
+            <div class="metric"><span class="metric-label">Recoverable (est.)</span><span id="d-recoverable" class="metric-value">0 B</span></div>
+            <div class="metric"><span class="metric-label">Files compared</span><span id="d-hashed" class="metric-value">0</span></div>
+          </div>
+
+          <p class="estimate-note muted small">Recoverable space is an <strong>estimate</strong> of what keeping one copy per group would free. Hard-linked copies already share storage and are not counted. APFS clones and snapshots may also mean less space is actually freed.</p>
+
+          <div id="dup-notices" class="notices"></div>
+
+          <div class="card table-card">
+            <div class="toolbar">
+              <input id="dup-search" type="search" placeholder="Search file paths" aria-label="Search duplicate groups" maxlength="200">
+              <select id="dup-sort" aria-label="Sort duplicate groups">
+                <option value="recoverable">Most space recoverable</option>
+                <option value="size">Largest file size</option>
+                <option value="count">Most copies</option>
+                <option value="path">Path (A–Z)</option>
+              </select>
+              <span id="dup-count" class="muted small"></span>
+            </div>
+            <div id="dup-groups" class="dup-groups"></div>
+            <div id="dup-empty" class="empty" hidden></div>
+            <div class="table-footer">
+              <button type="button" id="dup-more" class="btn btn-secondary" hidden>Show more</button>
+            </div>
+          </div>
+
+          <details id="dup-skipped-panel" class="card skipped" hidden>
+            <summary>Files that could not be checked</summary>
+            <ul id="dup-skipped-list"></ul>
+          </details>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer muted small">FilePilot runs entirely on this Mac. Nothing is uploaded.</footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>
